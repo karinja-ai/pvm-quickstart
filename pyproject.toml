@@ -1,0 +1,18 @@
+[project]
+name = "cubesandbox-pvm-automation"
+version = "0.1.0"
+description = "Ansible automation for a CubeSandbox PVM host"
+requires-python = ">=3.12"
+dependencies = [
+    "ansible-core==2.21.5",
+]
+
+[dependency-groups]
+dev = [
+    "ansible-lint==26.10.1",
+    "ruff==0.17.0",
+    "yamllint==1.38.0",
+]
+
+[tool.uv]
+package = false

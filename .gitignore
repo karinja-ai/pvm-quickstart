@@ -1,0 +1,26 @@
+# Local Ansible files
+/.venv/
+/ansible/inventory.ini
+/ansible/*.retry
+/ansible/__pycache__/
+/ansible/.ansible/
+__pycache__/
+.ruff_cache/
+*.py[cod]
+*.log
+*.credentials
+*secrets*
+cube.env
+s3.cfg
+
+# Generated run results and logs
+/results/
+/logs/
+
+# Local credentials and editor files
+.env
+.env.*
+*.pem
+id_rsa
+id_ed25519
+.DS_Store

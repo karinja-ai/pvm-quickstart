@@ -1,0 +1,417 @@
+---
+- name: Prepare a fresh Ubuntu host and install the PVM kernel
+  hosts: cube_hosts
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Check the fresh host image
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_release == "noble"
+          - ansible_facts.architecture == "x86_64"
+          - ansible_facts.processor_vcpus >= 4
+          - ansible_facts.memtotal_mb >= 30000
+        fail_msg: >-
+          This MVP needs a fresh Ubuntu 24.04 x86_64 host with at least
+          4 CPUs and 30 GiB RAM.
+
+    - name: Install host packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name:
+          - ca-certificates
+          - curl
+          - jq
+          - openssl
+          - psmisc
+          - python3-venv
+          - ufw
+          - xfsprogs
+        state: present
+
+    - name: Wait for Ubuntu first-boot upgrades before changing the kernel
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=ActiveState
+          - --value
+          - apt-daily-upgrade.service
+      register: apt_upgrade_before_kernel
+      until: apt_upgrade_before_kernel.stdout == "inactive"
+      retries: 90
+      delay: 10
+      changed_when: false
+
+    - name: Copy the guarded XFS disk setup script
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/prepare-data-disk.sh"
+        dest: /root/prepare-cubesandbox-data-disk.sh
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Format and mount the blank data disk as XFS with reflink
+      ansible.builtin.command:
+        argv:
+          - /root/prepare-cubesandbox-data-disk.sh
+          - "{{ cube_data_device }}"
+          - "{{ cube_data_mount }}"
+      register: data_disk_setup
+      changed_when: "'already mounted' not in data_disk_setup.stdout"
+
+    - name: Download the pinned PVM kernel package
+      ansible.builtin.get_url:
+        url: "{{ cube_pvm_deb_url }}"
+        dest: "/root/{{ cube_pvm_deb }}"
+        checksum: "sha256:{{ cube_pvm_deb_sha256 }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Download the pinned PVM GRUB helper
+      ansible.builtin.get_url:
+        url: "{{ cube_grub_helper_url }}"
+        dest: /root/host_grub_config.sh
+        checksum: "sha256:{{ cube_grub_helper_sha256 }}"
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the PVM kernel and set the next boot entry
+      ansible.builtin.script: >-
+        {{ playbook_dir }}/files/02-install-pvm-kernel.sh
+        /root/{{ cube_pvm_deb }} /root/host_grub_config.sh
+      when: ansible_facts.kernel != cube_pvm_kernel
+
+    - name: Reboot into the PVM kernel
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        connect_timeout: 10
+        post_reboot_delay: 10
+      when: ansible_facts.kernel != cube_pvm_kernel
+
+- name: Install CubeSandbox and build a ready XFS template
+  hosts: cube_hosts
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Check that the PVM kernel booted
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.kernel == cube_pvm_kernel
+        fail_msg: "The host did not boot the pinned CubeSandbox PVM kernel."
+
+    - name: Verify the PVM module and keep this kernel as the default
+      ansible.builtin.script: "{{ playbook_dir }}/files/02b-verify-pvm.sh"
+
+    - name: Enable the cgroup v2 CPU controller
+      ansible.builtin.script: "{{ playbook_dir }}/files/02c-fix-cgroup-cpu.sh"
+
+    - name: Set the host firewall policy
+      ansible.builtin.command: ufw default deny incoming
+      changed_when: false
+
+    - name: Allow SSH through the host firewall
+      ansible.builtin.command: ufw allow OpenSSH
+      register: allow_ssh
+      changed_when: "'Skipping' not in allow_ssh.stdout"
+
+    - name: Enable the host firewall
+      ansible.builtin.command: ufw --force enable
+      register: firewall_enable
+      changed_when: "'Firewall is active' in firewall_enable.stdout"
+
+    - name: Download the pinned CubeSandbox release bundle
+      ansible.builtin.get_url:
+        url: "{{ cube_bundle_url }}"
+        dest: "/root/{{ cube_bundle }}"
+        checksum: "sha256:{{ cube_bundle_sha256 }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Unpack the CubeSandbox release bundle
+      ansible.builtin.unarchive:
+        src: "/root/{{ cube_bundle }}"
+        dest: /root
+        remote_src: true
+        creates: "{{ cube_bundle_dir }}/install.sh"
+
+    - name: Fix the v0.7.2 WebUI probe before CubeSandbox starts
+      ansible.builtin.blockinfile:
+        path: "{{ cube_bundle_dir }}/install.sh"
+        insertafter: '^install_systemd_units$'
+        marker: "# {mark} CUBESANDBOX ARTICLE WEBUI HEALTH FIX"
+        block: |
+          if [[ -f "${INSTALL_PREFIX}/scripts/systemd/webui-postcheck.sh" ]]; then
+            sed -i 's|/health"|/healthz"|' "${INSTALL_PREFIX}/scripts/systemd/webui-postcheck.sh"
+          fi
+      tags:
+        - installer_health_fix
+
+    - name: Write XFS-only CubeSandbox settings
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/cube.env.j2"
+        dest: "{{ cube_bundle_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Create the install log directory
+      ansible.builtin.file:
+        path: /var/log/cubesandbox-automation
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Pause Ubuntu automatic update timers during the CubeSandbox install
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+
+    - name: Wait for update jobs and package locks to clear
+      ansible.builtin.shell: |
+        if systemctl is-active --quiet apt-daily.service || systemctl is-active --quiet apt-daily-upgrade.service; then
+          exit 1
+        fi
+        if fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; then
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: apt_jobs_before_cube
+      until: apt_jobs_before_cube.rc == 0
+      retries: 90
+      delay: 10
+      changed_when: false
+
+    - name: Install CubeSandbox in PVM mode
+      block:
+        - name: Run the CubeSandbox installer
+          ansible.builtin.shell: >-
+            set -o pipefail;
+            ./install.sh --mode=install --node-ip {{ cube_node_public_ip }}
+            2>&1 | tee -a /var/log/cubesandbox-automation/install.log
+          args:
+            executable: /bin/bash
+            chdir: "{{ cube_bundle_dir }}"
+          environment:
+            ONE_CLICK_ASSUME_YES: "1"
+          changed_when: true
+          no_log: true
+      always:
+        - name: Restart Ubuntu automatic update timers
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: started
+          loop:
+            - apt-daily.timer
+            - apt-daily-upgrade.timer
+
+    - name: Fix the v0.7.2 WebUI readiness path
+      ansible.builtin.replace:
+        path: /usr/local/services/cubetoolbox/scripts/systemd/webui-postcheck.sh
+        regexp: 'http://127\.0\.0\.1:\$\{port\}/health"'
+        replace: 'http://127.0.0.1:${port}/healthz"'
+
+    - name: Restrict the WebUI and allow its local API path
+      ansible.builtin.script: "{{ playbook_dir }}/files/restrict-webui.sh"
+
+    - name: Wait for the local CubeSandbox API
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 3000
+        delay: 5
+        timeout: 600
+
+    - name: Wait for CubeOps and CubeTemplateCenter
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ item }}"
+        delay: 3
+        timeout: 600
+      loop:
+        - 3010
+        - 8089
+
+    - name: Run the CubeSandbox release quick check
+      ansible.builtin.command:
+        argv:
+          - /usr/local/services/cubetoolbox/scripts/one-click/quickcheck.sh
+      register: cube_quickcheck
+      changed_when: false
+      tags:
+        - cube_quickcheck
+
+    - name: Create the Python SDK virtual environment
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -m
+          - venv
+          - "{{ cube_sdk_venv }}"
+        creates: "{{ cube_sdk_venv }}/bin/python"
+
+    - name: Install the pinned Python SDK
+      ansible.builtin.pip:
+        name: "cubesandbox=={{ cube_sdk_version }}"
+        virtualenv: "{{ cube_sdk_venv }}"
+
+    - name: Create an XFS template from a pinned image
+      ansible.builtin.command:
+        argv:
+          - cubemastercli
+          - -a
+          - 127.0.0.1
+          - -p
+          - "8089"
+          - template
+          - create-from-image
+          - --image
+          - "{{ cube_template_image }}"
+          - --alias
+          - "{{ cube_template_alias }}"
+          - --backend
+          - xfs
+          - --node
+          - "{{ cube_node_public_ip }}"
+          - --writable-layer-size
+          - 1G
+          - --expose-port
+          - "49999"
+          - --expose-port
+          - "49983"
+          - --probe
+          - "49999"
+          - --probe-path
+          - /health
+          - --cpu
+          - "{{ cube_template_cpu_millicores }}"
+          - --memory
+          - "{{ cube_template_memory_mib }}"
+          - --detach
+          - --json
+      register: template_create
+      changed_when: true
+
+    - name: Save the template job and ID
+      ansible.builtin.set_fact:
+        cube_template_job_id: "{{ (template_create.stdout | from_json).job.job_id }}"
+        cube_template_id: "{{ (template_create.stdout | from_json).job.template_id }}"
+
+    - name: Wait for the template build
+      ansible.builtin.command:
+        argv:
+          - cubemastercli
+          - -a
+          - 127.0.0.1
+          - -p
+          - "8089"
+          - template
+          - watch
+          - --job-id
+          - "{{ cube_template_job_id }}"
+          - --interval
+          - 5s
+          - --json
+      register: template_watch
+      changed_when: false
+
+    - name: Check the template build result
+      ansible.builtin.assert:
+        that:
+          - (template_watch.stdout | from_json).job.status == "READY"
+        fail_msg: "CubeSandbox did not build a ready XFS template."
+
+    - name: Read the ready template details
+      ansible.builtin.command:
+        argv:
+          - cubemastercli
+          - -a
+          - 127.0.0.1
+          - -p
+          - "8089"
+          - template
+          - info
+          - --template-id
+          - "{{ cube_template_id }}"
+          - --json
+      register: template_info
+      changed_when: false
+
+    - name: Check the template backend and pinned image
+      ansible.builtin.assert:
+        that:
+          - (template_info.stdout | from_json).status == "READY"
+          - (template_info.stdout | from_json).storage_backend == "xfs"
+          - (template_info.stdout | from_json).image_info == cube_template_image
+
+    - name: Check that no systemd units failed
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --failed
+          - --no-legend
+      register: failed_units
+      changed_when: false
+      failed_when: failed_units.stdout | trim | length > 0
+
+    - name: Record the test finish time
+      ansible.builtin.command:
+        argv:
+          - date
+          - -u
+          - +%Y-%m-%dT%H:%M:%SZ
+      register: cube_test_finished
+      changed_when: false
+
+    - name: Save the tested host record
+      ansible.builtin.copy:
+        dest: /root/cubesandbox-automation-result.json
+        owner: root
+        group: root
+        mode: "0600"
+        content: >-
+          {{ {
+            'tested_at_utc': cube_test_finished.stdout,
+            'host_ip': cube_node_public_ip,
+            'os': ansible_facts.distribution ~ ' ' ~ ansible_facts.distribution_version,
+            'kernel': ansible_facts.kernel,
+            'cpu_count': ansible_facts.processor_vcpus,
+            'memory_total_mib': ansible_facts.memtotal_mb,
+            'data_mount': cube_data_mount,
+            'data_device': cube_data_device,
+            'filesystem': 'xfs',
+            'reflink': true,
+            's3_enabled': false,
+            'cube_quickcheck': 'passed',
+            'sandbox_run': 'not run; use benchmark.yml when ready',
+            'webui_health_path_fix': '/health to /healthz',
+            'bundle_sha256': cube_bundle_sha256,
+            'template': (template_info.stdout | from_json)
+          } | to_nice_json }}
+
+    - name: Create the local results directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../results"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch the tested host record to the project
+      ansible.builtin.fetch:
+        src: /root/cubesandbox-automation-result.json
+        dest: "{{ playbook_dir }}/../results/{{ cube_node_public_ip }}.json"
+        flat: true
+
+    - name: Show the ready template ID
+      ansible.builtin.debug:
+        msg: "CubeSandbox setup is ready. XFS template ID: {{ cube_template_id }}."

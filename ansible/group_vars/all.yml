@@ -1,0 +1,19 @@
+cube_data_device: /dev/vdb
+cube_data_mount: /data/cubelet
+cube_node_public_ip: "{{ ansible_host }}"
+cube_pvm_kernel: 6.6.117-opencloudos9.cubesandbox.pvm.host-gbc75224fca7e
+cube_pvm_deb: linux-image-6.6.117-opencloudos9.cubesandbox.pvm.host-gbc75224fca7e_6.6.117-gbc75224fca7e-1_amd64.deb
+cube_pvm_deb_sha256: 821f260869b96e875505b7c947fa5deffbf5daf95cb36751314a1e04c9906da6
+cube_pvm_deb_url: https://github.com/TencentCloud/CubeSandbox/releases/download/kernel-release-261012-1/{{ cube_pvm_deb }}
+cube_grub_helper_url: https://raw.githubusercontent.com/TencentCloud/CubeSandbox/f1aaa737fb3862202b1731e0e0d844c28779f930/deploy/pvm/grub/host_grub_config.sh
+cube_grub_helper_sha256: 37d02c2f8b7002ab6ea8402aae151f404832b002c4de0c0d695b69fd6c62f3ab
+cube_bundle: cube-sandbox-one-click-v0.7.2-amd64.tar.gz
+cube_bundle_sha256: da5746dc277418363812aab91ed669cec56c411b77040ee26fb7c2be19d98e21
+cube_bundle_url: https://github.com/TencentCloud/CubeSandbox/releases/download/v0.7.2/{{ cube_bundle }}
+cube_bundle_dir: /root/cube-sandbox-one-click-v0.7.2-amd64
+cube_template_alias: cube-mvp-xfs-1cpu-512m
+cube_template_cpu_millicores: 1000
+cube_template_memory_mib: 512
+cube_template_image: cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code@sha256:467494c38f3c335e42d590e23d5cbb00dc15c2627c9da4f7e7f3bd9f4ec18c5e
+cube_sdk_version: 0.7.0
+cube_sdk_venv: /opt/cubesandbox-automation-venv

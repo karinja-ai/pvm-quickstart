@@ -1,0 +1,176 @@
+---
+- name: Run the optional XFS lifecycle benchmark
+  hosts: cube_hosts
+  become: true
+  gather_facts: false
+  vars:
+    benchmark_warmups: 5
+    benchmark_runs: 50
+    benchmark_working_set_mib: 0
+    benchmark_remote_script: /root/cube-lifecycle-benchmark.py
+    benchmark_remote_result: /root/cube-lifecycle-xfs-results.json
+
+  tasks:
+    - name: Create the local results directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../results"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Record automatic update timer states
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ item }}"
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      register: benchmark_update_timer_state
+      changed_when: false
+      failed_when: false
+
+    - name: Keep the timers that were active before the benchmark
+      ansible.builtin.set_fact:
+        benchmark_active_update_timers: >-
+          {{ benchmark_update_timer_state.results
+             | selectattr('stdout', 'equalto', 'active')
+             | map(attribute='item') | list }}
+
+    - name: Run the benchmark with package and kernel updates paused
+      block:
+        - name: Wait for current package updates and locks to clear
+          ansible.builtin.shell: |
+            for unit in apt-daily.service apt-daily-upgrade.service; do
+              state="$(systemctl show --property=ActiveState --value "$unit")"
+              if [ "$state" != inactive ] && [ "$state" != failed ]; then
+                exit 1
+              fi
+            done
+            if fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; then
+              exit 1
+            fi
+          args:
+            executable: /bin/bash
+          register: benchmark_apt_jobs
+          until: benchmark_apt_jobs.rc == 0
+          retries: 90
+          delay: 10
+          changed_when: false
+
+        - name: Stop automatic update timers during measurements
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop: "{{ benchmark_active_update_timers }}"
+
+        - name: Check benchmark inputs
+          ansible.builtin.assert:
+            that:
+              - (benchmark_warmups | int) >= 0
+              - (benchmark_runs | int) > 0
+              - (benchmark_working_set_mib | int) in [0, 128, 512]
+            fail_msg: "Use zero or more warm-ups, at least one measured run, and a work set of 0, 128, or 512 MiB."
+
+        - name: Read the setup record
+          ansible.builtin.slurp:
+            src: /root/cubesandbox-automation-result.json
+          register: setup_record
+
+        - name: Read the XFS template details from the setup record
+          ansible.builtin.set_fact:
+            benchmark_template: "{{ (setup_record.content | b64decode | from_json).template }}"
+
+        - name: Check that setup made a ready XFS template
+          ansible.builtin.assert:
+            that:
+              - benchmark_template.status == "READY"
+              - benchmark_template.storage_backend == "xfs"
+            fail_msg: "Run site.yml first. It must create a ready XFS template."
+
+        - name: Check that the guest working set fits the template
+          ansible.builtin.assert:
+            that:
+              - >-
+                (benchmark_working_set_mib | int) == 0 or
+                (cube_template_memory_mib | int) >= ((benchmark_working_set_mib | int) * 2)
+            fail_msg: >-
+              Use a template with at least twice the touched-memory size. The default
+              template has 512 MiB RAM, so use 128 MiB or less with this template.
+
+        - name: Copy the lifecycle benchmark script
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/lifecycle-benchmark.py"
+            dest: "{{ benchmark_remote_script }}"
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Create the result directory
+          ansible.builtin.file:
+            path: "{{ benchmark_remote_result | dirname }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Run the XFS create-snapshot-pause-resume benchmark
+          ansible.builtin.command:
+            argv:
+              - "{{ cube_sdk_venv }}/bin/python"
+              - "{{ benchmark_remote_script }}"
+              - xfs
+              - "{{ benchmark_template.template_id }}"
+              - --warmups
+              - "{{ benchmark_warmups }}"
+              - --runs
+              - "{{ benchmark_runs }}"
+              - --working-set-mib
+              - "{{ benchmark_working_set_mib }}"
+              - --output
+              - "{{ benchmark_remote_result }}"
+          environment:
+            CUBE_PROXY_NODE_IP: "{{ cube_node_public_ip }}"
+          register: benchmark_command
+          changed_when: true
+
+        - name: Read the benchmark result file
+          ansible.builtin.slurp:
+            src: "{{ benchmark_remote_result }}"
+          register: benchmark_result_file
+
+        - name: Parse the benchmark result file
+          ansible.builtin.set_fact:
+            benchmark_result: "{{ benchmark_result_file.content | b64decode | from_json }}"
+
+        - name: Check that all benchmark runs completed
+          ansible.builtin.assert:
+            that:
+              - benchmark_result.backend == "xfs"
+              - benchmark_result.rows | length == (benchmark_warmups | int) + (benchmark_runs | int)
+              - >-
+                (benchmark_result.rows | selectattr('ok', 'equalto', false) | list | length) == 0
+              - >-
+                (benchmark_result.rows | selectattr('cleanup_errors', 'defined') | list | length) == 0
+            fail_msg: "One or more benchmark runs failed. Check the task output and result JSON."
+
+        - name: Fetch benchmark results to the project
+          ansible.builtin.fetch:
+            src: "{{ benchmark_remote_result }}"
+            dest: "{{ playbook_dir }}/../results/xfs-lifecycle-{{ cube_node_public_ip }}.json"
+            flat: true
+
+        - name: Show the local result file
+          ansible.builtin.debug:
+            msg: >-
+              Benchmark complete. Results are in
+              results/xfs-lifecycle-{{ cube_node_public_ip }}.json.
+
+      always:
+        - name: Restore automatic update timers after the benchmark
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: started
+          loop: "{{ benchmark_active_update_timers }}"
